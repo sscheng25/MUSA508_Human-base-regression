@@ -1,0 +1,547 @@
+---
+title: "MUSA 508 - Assignment 4"
+subtitle: "Housing Subsidy in Emil City"
+author: "Sisun Cheng"
+date: "2021/11/4"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+# 0. Motivation
+
+The Department of Housing and Community Development (HCD) in Emil City is launching a home repair tax credit program, and they want to reach out to those who are most likely to take this credit at a low cost. When reaching out randomly, only 11% of the homeowners take this credit and the unsuccessful reach out also wastes a large amount of money.
+
+In order to make the most use of the housing subsidy and create a satisfying benefit, I will build a logistic regression model to predict under given features whether a homeowner will take the credit or not. 
+
+# 1. Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+
+options(scipen=10000000)
+
+library(tidyverse)
+library(kableExtra)
+library(caret)
+library(knitr) 
+library(pscl)
+library(plotROC)
+library(pROC)
+library(lubridate)
+library(cowplot)
+
+palette5 <- c("#FA8072","#9FE2BF","#FF006A","#FE4C35","#FE9900")
+palette4 <- c("#FA8072","#9FE2BF","#FE4C35","#FE9900")
+palette2 <- c("#FA8072","#9FE2BF")
+```
+
+# 2. Data Exploration
+
+## 2.1 Data Visualization
+
+In this part, I import housing subsidy data of Emil City from .csv, and make a visualization exploring the importance or correlation of each feature and the result of whether or not taking the credit. 
+
+```{r read the data}
+# read the data
+housingSubsidy <- read.csv("C:/Users/CSS/Desktop/MUSA508-Assignment4/Chp6/housingSubsidy.csv")
+# glimpse(housingSubsidy)
+```
+
+For the continuous features, bar plots of feature means grouped by whether or not taking the credit are made. The curve of each continuous feature are also made grouped by whether or not taking the credit.
+
+```{r exploratory_continuous, fig.height=8, fig.width=10, warning=FALSE}
+# exploratory_continuous
+housingSubsidy %>%
+  dplyr::select(y, age, campaign, previous, unemploy_rate, cons.price.idx, cons.conf.idx, spent_on_repairs, inflation_rate) %>%
+  gather(Variable, value, -y) %>%
+  ggplot(aes(y, value, fill=y)) + 
+  geom_bar(position = "dodge", stat = "summary", fun.y = "mean") + 
+  facet_wrap(~Variable, scales = "free") +
+  scale_fill_manual(values = palette2) +
+  labs(x="Taking the credit", y="Value", 
+       title = "Feature associations with the likelihood of taking the credit",
+       subtitle = "(continous features)") +
+  theme(legend.position = "none")
+
+housingSubsidy %>%
+  dplyr::select(y, age, campaign, previous, unemploy_rate, cons.price.idx, cons.conf.idx, spent_on_repairs, inflation_rate) %>%
+  gather(Variable, value, -y) %>%
+  ggplot() + 
+  geom_density(aes(value, color=y), fill = "transparent") + 
+  facet_wrap(~Variable, scales = "free") +
+  scale_fill_manual(values = palette2) +
+  labs(title = "Feature distributions taking the credit vs. not taking",
+       subtitle = "(continous features)") +
+  theme(legend.position = "none")
+```
+
+For the categorical features, histograms of each category are made and also group by whether taking the credit.
+
+```{r exploring categorical, fig.height=8, fig.width=10}
+# exploring categorical
+housingSubsidy %>%
+  dplyr::select(y, taxbill_in_phl, education, marital, mortgage, contact, month, poutcome, day_of_week) %>%
+  gather(Variable, value, -y) %>%
+  count(Variable, value, y) %>%
+  ggplot(., aes(value, n, fill = y)) +   
+  geom_bar(position = "dodge", stat="identity") +
+  facet_wrap(~Variable, scales="free") +
+  scale_fill_manual(values = palette2) +
+  labs(x="y", y="Value",
+       title = "Feature associations with the likelihood of taking the credit",
+       subtitle = "(categorical features)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 2.2 Model 0
+
+Before doing any further data engineering, I run the very first logistic regression model with all the variables. I name this model with "model 0".
+
+```{r create partition 0 , warning=FALSE}
+# create partition for model 0
+set.seed(3456)
+trainIndex0 <- createDataPartition(y = paste(housingSubsidy$taxLien, housingSubsidy$education, 
+                                            housingSubsidy$campaign, housingSubsidy$contact), 
+                                  p = .65,
+                                  list = FALSE,
+                                  times = 1)
+subsidyTrain0 <- housingSubsidy[ trainIndex0,]
+subsidyTest0  <- housingSubsidy[-trainIndex0,]
+```
+
+
+```{r model 0}
+# model 0
+subsidyModel0 <- glm(y_numeric ~ .,
+                    data=subsidyTrain0 %>% 
+                    dplyr::select(-X, -y),
+                    family="binomial" (link="logit"))
+
+summary(subsidyModel0)
+
+test_Probs0 <- data.frame(Outcome = as.factor(subsidyTest0$y_numeric),
+                        Probs = predict(subsidyModel0, subsidyTest0, type= "response"))
+```
+
+## 2.3 Variable Transformations
+
+In order to improve the goodness of fit for my model, I focus on feature engineering in this part. There are some categorical variables with so many categories that causes confusion when training the model. I combine some of these categories with similar meanings to simplify the training process. I reclassify **education** into 4 levels, **job** into 4 levels of income, and **pdays** into 4 categories according to the number of days since last connection.
+
+```{r variable transformation}
+
+housingSubsidy <- 
+  housingSubsidy %>% 
+  mutate(education,
+         education = case_when(education == "basic.4y" ~ "medium",
+                               education == "basic.6y" ~ "medium",
+                               education == "basic.9y" ~ "high",
+                               education == "high.school" ~ "high", 
+                               education == "professional.course" ~ "high",
+                               education == "university.degree" ~ "very high",
+                               education == "illiterate"  ~ "low", 
+                               education == "unknown" ~ "low"))
+housingSubsidy <- 
+  housingSubsidy %>% 
+  mutate(job,
+         job = case_when(job == "retired" ~ "low income",
+                         job == "unemployed" ~ "low income", 
+                         job =="unknown" ~ "low income", 
+                         job == "student" ~ "low income",
+                         job == "housemaid" ~ "medium income",
+                         job == "blue-collar" ~ "medium income",
+                         job == "services" ~ "medium income",
+                         job == "technician" ~ "high income",
+                         job ==  "management" ~ "high income",
+                         job == "admin." ~ "high income",
+                         job == "entrepreneur" ~ "very high income", 
+                         job == "self-employed" ~ "medium income"))
+
+housingSubsidy <-
+  housingSubsidy %>%
+  mutate(pdays,
+         pdays = case_when(pdays == "0"  ~ "0-6",
+                           pdays == "1" ~ "0-6", 
+                           pdays == "2" ~ "0-6", 
+                           pdays == "3" ~ "0-6", 
+                           pdays == "4" ~ "0-6", 
+                           pdays == "5" ~ "0-6", 
+                           pdays == "6" ~ "0-6", 
+                           pdays == "7" ~ "7-15",
+                           pdays == "9"  ~ "7-15",
+                           pdays == "10"  ~ "7-15", 
+                           pdays == "11"  ~ "7-15", 
+                           pdays == "12"  ~ "7-15", 
+                           pdays == "13"  ~ "7-15", 
+                           pdays == "14"  ~ "7-15", 
+                           pdays == "15"  ~ "7-15", 
+                           pdays == "17" ~ "16-21", 
+                           pdays == "18" ~ "16-21",
+                           pdays == "19" ~ "16-21", 
+                           pdays == "21"~ "16-21", 
+                           pdays == "16" ~ "16-21",
+                           pdays == "999" ~ "unknown"))
+
+```
+
+# 3. Regression Model
+
+In this part comes my regression model with engineered features. First, I split the housing subsidy data into 65:35 training dataset and test dataset. To make sure some of the important feature classes are all included in the train dataset, I use **createDataPartition** function to split the data. Then I run the binary regression model with all engineered features, and I call this model "model 1". The AIC value of model 1 is lower than that of model 0, indicating a better fit.
+
+```{r create_partition , warning=FALSE}
+# create partition for model 1
+set.seed(3456)
+trainIndex <- createDataPartition(y = paste(housingSubsidy$taxLien, housingSubsidy$education, 
+                                            housingSubsidy$campaign, housingSubsidy$contact), 
+                                  p = .65,
+                                  list = FALSE,
+                                  times = 1)
+subsidyTrain <- housingSubsidy[ trainIndex,]
+subsidyTest  <- housingSubsidy[-trainIndex,]
+```
+
+
+```{r model 1}
+# model 1
+subsidyModel1 <- glm(y_numeric ~ .,
+                    data=subsidyTrain %>% 
+                    dplyr::select(-X, -y),
+                    family="binomial" (link="logit"))
+
+summary(subsidyModel1)
+```
+
+I also trained a "model 2" with a subset of engineered features. In model 2, I exclude 3 variables -- taxbill_in_phl, unemploy_rate, and inflation_rate. Through the data exploration process and my own understanding, I think these three variables are less relative to the dependent variable of my model. After taking away these 3 variables, the AIC value falls to 1546.7, indicating a slightly better fit than model 1 (1551.2).
+
+```{r model 2}
+# model 2
+subsidyModel2 <- glm(y_numeric ~ .,
+                    data=subsidyTrain %>% 
+                    dplyr::select(-X, -y, -taxbill_in_phl, -unemploy_rate, -inflation_rate),
+                    family="binomial" (link="logit"))
+
+summary(subsidyModel2)
+```
+
+# 4. Goodness of Fit
+
+In this part, I make an analysis on the goodness of fit of the three models. As is shown below, I calculate the fit metrics of each model. Model 1 has the largest McFadden value, indicating the best fit. However, there is only a very small gap between the McFadden value of model 2 and model 1 (<0.001), which can be ignored in some way. This means, model 1 and model 2 have very similar goodness of fit according to McFadden value, and these two models are much better than model 0 with the raw features.
+
+## 4.1 Fit Metrics and Probability Distribution
+
+```{r fit metric}
+# fit metric
+pR2(subsidyModel0)
+pR2(subsidyModel1)
+pR2(subsidyModel2)
+```
+
+Here, I calculate the probability results of test datasets. The results of three models are compared as follows. The plots of distribution of predicted probabilities by observed outcome show a sharing characteristic of three model -- they can all predict the ones who do not take the credit very well, but can hardly tell who will take the credit, with a threshold of 0.5. 
+
+```{r test Probabilities}
+# test probabilities
+test_Probs1 <- data.frame(Outcome = as.factor(subsidyTest$y_numeric),
+                        Probs = predict(subsidyModel1, subsidyTest, type= "response"))
+
+test_Probs2 <- data.frame(Outcome = as.factor(subsidyTest$y_numeric),
+                         Probs = predict(subsidyModel2, subsidyTest, type= "response"))
+```
+
+
+```{r plot test probs}
+# plot test probabilities
+ggplot(test_Probs0, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = palette2) +
+  labs(x = "y", y = "Density of probabilities",
+       title = "Distribution of predicted probabilities by observed outcome - Model 0") +
+  theme(strip.text.x = element_text(size = 18),
+        legend.position = "none")
+
+ggplot(test_Probs1, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = palette2) +
+  labs(x = "y", y = "Density of probabilities",
+       title = "Distribution of predicted probabilities by observed outcome - Model 1") +
+  theme(strip.text.x = element_text(size = 18),
+        legend.position = "none")
+
+ggplot(test_Probs2, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = palette2) +
+  labs(x = "y", y = "Density of probabilities",
+       title = "Distribution of predicted probabilities by observed outcome - Model 2") +
+  theme(strip.text.x = element_text(size = 18),
+        legend.position = "none")
+```
+
+## 4.2 Confusion Metrics
+
+To better tell the prediction performance of three models, the confusion metrics are presented as follows. The three models have a quite similar overall accuracy, and all three models can predict specificity (true negative) well. But when it comes to sensitivity (the ability of correctly predicting true positive), model 1 performs the best (sensitivity = 0.27737), followed by model 2 (sensitivity =0.25547), and model 0 (sensitivity =0.23239). Since our goal is to find a model that can tell who will take the credit most accurately, model 1 is the best model that we want under this specific demand.
+
+```{r confusion metric}
+# confusion metric
+test_Probs0 <- 
+  test_Probs0 %>%
+  mutate(predOutcome  = as.factor(ifelse(test_Probs0$Probs > 0.5 , 1, 0)))
+caret::confusionMatrix(test_Probs0$predOutcome, test_Probs0$Outcome, 
+                       positive = "1")
+
+test_Probs1 <- 
+  test_Probs1 %>%
+  mutate(predOutcome  = as.factor(ifelse(test_Probs1$Probs > 0.5 , 1, 0)))
+caret::confusionMatrix(test_Probs1$predOutcome, test_Probs1$Outcome, 
+                       positive = "1")
+test_Probs2 <- 
+  test_Probs2 %>%
+  mutate(predOutcome  = as.factor(ifelse(test_Probs2$Probs > 0.5 , 1, 0)))
+caret::confusionMatrix(test_Probs2$predOutcome, test_Probs2$Outcome, 
+                       positive = "1")
+```
+
+## 4.3 ROC Curve
+
+To better illustrate, I draw the ROC curve of three models. On ROC curve, every single dot (a%, b%) means the model will predict true positive correctly b% of all the time while predict false positive a% of all the time under this specific threshold. The goal is to maximum the area under the curve, so that the model has the best fit. Comparing the three models, model 0 has the largest area under curve (0.764), and model 1 and model 2 have 0.7358 and 0.7303 namely. Taking only ROC curve into consideration, model 0 seems to perform best.
+
+```{r ROC Curve, warning=FALSE, fig.height=4, fig.width=16}
+# ROC Curve
+area0 <- auc(test_Probs0$Outcome, test_Probs0$Probs)
+area1 <- auc(test_Probs1$Outcome, test_Probs1$Probs)
+area2 <- auc(test_Probs2$Outcome, test_Probs2$Probs)
+cat("\nModel 0 area under the curve: ", area0)
+cat("\nModel 1 area under the curve: ", area1)
+cat("\nModel 2 area under the curve: ", area2)
+
+roc0 <- ggplot(test_Probs0, aes(d = as.numeric(test_Probs0$Outcome), m = Probs)) +
+          geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+          style_roc(theme = theme_grey) +
+          geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+          labs(title = "ROC Curve - Model0")
+
+roc1 <- ggplot(test_Probs1, aes(d = as.numeric(test_Probs1$Outcome), m = Probs)) +
+          geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+          style_roc(theme = theme_grey) +
+          geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+          labs(title = "ROC Curve - Model1")
+
+roc2 <- ggplot(test_Probs2, aes(d = as.numeric(test_Probs2$Outcome), m = Probs)) +
+          geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+          style_roc(theme = theme_grey) +
+          geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+          labs(title = "ROC Curve - Model2")
+
+plot_grid(roc0, roc1, roc2, ncol =3)
+```
+
+## 4.4 Cross-validation
+
+Because of the similarity of model 1 and model 2 in several accuracy indexes above, from now on I will only focus on model 0 and model 1.
+
+Here I do the cross validation for both models, the results of two models are also similar. Model 1's mean area under ROC curve is larger than that of model 0, while mean sensitivity of model 1 is slightly lower than model 0. The mean specificity are also very close.
+
+```{r cross validation 0 , warning=FALSE}
+# cross validation for model 0
+
+housingSubsidy0 <- read.csv("C:/Users/CSS/Desktop/MUSA508-Assignment4/Chp6/housingSubsidy.csv")
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE, summaryFunction=twoClassSummary)
+
+cvFit0 <- train(y ~ .,
+               data=housingSubsidy0 %>% 
+               dplyr::select(-X, -y_numeric) %>%
+               dplyr::mutate(y = ifelse(y == "no", "yes", "no")), 
+               method="glm", family="binomial",
+               metric="ROC", trControl = ctrl)
+
+cvFit0
+```
+
+
+```{r cross validation 1 , warning=FALSE}
+# cross validation for model 1
+
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE, summaryFunction=twoClassSummary)
+
+cvFit1 <- train(y ~ .,
+               data=housingSubsidy %>% 
+               dplyr::select(-X, -y_numeric) %>%
+               dplyr::mutate(y = ifelse(y == "no", "yes", "no")), 
+               method="glm", family="binomial",
+               metric="ROC", trControl = ctrl)
+
+cvFit1
+```
+
+
+```{r goodness_metrics, warning=FALSE}
+dplyr::select(cvFit0$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit0$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+  geom_histogram(bins=35, fill = "#FA8072") +
+  facet_wrap(~metric) +
+  geom_vline(aes(xintercept = mean), colour = "#FE9900", linetype = 2, size = 1.5) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics - Model 0",
+       subtitle = "Across-fold mean reprented as dotted lines")
+
+dplyr::select(cvFit1$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit1$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+  geom_histogram(bins=35, fill = "#FA8072") +
+  facet_wrap(~metric) +
+  geom_vline(aes(xintercept = mean), colour = "#FE9900", linetype = 2, size = 1.5) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics - Model 1",
+       subtitle = "Across-fold mean reprented as dotted lines")
+```
+
+# 5. Cost-Benefit Analysis
+
+## 5.1 Cost-Benefit Table
+
+Due to the higher sensitivity, I select model 1 (feature engineered) as the final model into the cost-benefit analysis process. The equations of cost-benefit calculation are listed as follows. 
+
+
+* 'True Positive': (-2850 + 0.25 * (10000 + 56000 -5000)) * Count
+
+* 'True Negative':  Count * 0
+
+* 'False Positive':  (-2850) * Count
+
+* 'False Negative':  Count * 0
+
+The cost-benefit table is also created. As is shown in the table, when threshold = 0.5, the revenue of true-positive is 471200, true-negative is 0, false-positive is -94050, and false-negative is 0. In general, the benefits overweigh the costs.
+
+```{r cost benefit table}
+# cost benefit table
+cost_benefit_table <-
+  test_Probs1 %>%
+  count(predOutcome, Outcome) %>%
+  summarize(True_Negative = sum(n[predOutcome==0 & Outcome==0]),
+            True_Positive = sum(n[predOutcome==1 & Outcome==1]),
+            False_Negative = sum(n[predOutcome==0 & Outcome==1]),
+            False_Positive = sum(n[predOutcome==1 & Outcome==0])) %>%
+  gather(Variable, Count) %>%
+  mutate(Revenue =
+           ifelse(Variable == "True_Negative", Count * 0,
+                  ifelse(Variable == "True_Positive",((-2850 + 0.25 * (10000 + 56000 -5000)) * Count),
+                         ifelse(Variable == "False_Negative", Count * 0,
+                                ifelse(Variable == "False_Positive", (-2850) * Count, 0))))) %>%
+  bind_cols(data.frame(Description = c(
+    "Predicted correctly homeowner would not take the credit, no marketing resources were allocated, and no credit was allocated",
+    "Predicted correctly homeowner would take the credit; allocated the marketing resources, and 25% took the credit",
+    "We predicted that a homeowner would not take the credit but they did. These are likely homeowners who signed up for reasons unrelated to the marketing campaign. Thus, we ‘0 out’ this category, assuming the cost/benefit of this is $0",
+    "Predicted incorrectly homeowner would take the credit; allocated marketing resources; no credit allocated")))
+
+kable(cost_benefit_table,
+      caption = "Cost/Benefit Table") %>% kable_styling()
+```
+
+## 5.2 Threshold Exploration
+
+
+```{r iterate_threshold}
+iterateThresholds <- function(data) {
+  x = .01
+  all_prediction <- data.frame()
+  while (x <= 1) {
+  
+  this_prediction <-
+      test_Probs1 %>%
+      mutate(predOutcome = ifelse(Probs > x, 1, 0)) %>%
+      count(predOutcome, Outcome) %>%
+      summarize(True_Negative = sum(n[predOutcome==0 & Outcome==0]),
+                True_Positive = sum(n[predOutcome==1 & Outcome==1]),
+                False_Negative = sum(n[predOutcome==0 & Outcome==1]),
+                False_Positive = sum(n[predOutcome==1 & Outcome==0])) %>%
+     gather(Variable, Count) %>%
+     mutate(Revenue =
+               ifelse(Variable == "True_Negative", Count * 0,
+               ifelse(Variable == "True_Positive", (-2850 + 0.25 *(10000 + 56000 -5000)) * Count,
+               ifelse(Variable == "False_Negative", Count * 0,
+               ifelse(Variable == "False_Positive", (-2850) * Count, 0)))),
+            Threshold = x)
+  
+  all_prediction <- rbind(all_prediction, this_prediction)
+  x <- x + .01
+  }
+return(all_prediction)
+}
+```
+
+As threshold changes, the ratio of confusion metric changes as well. The trend is shown in the plot below.
+
+```{r confusion metric outcome}
+whichThreshold <- iterateThresholds(test_Probs1)
+
+whichThreshold %>%
+  ggplot(.,aes(Threshold, Count, colour = Variable)) +
+  geom_point() +
+  scale_colour_manual(values = palette4) +    
+  labs(title = "Confusion Metric Outcome by Threshold",
+       y = "Count") +
+  guides(colour=guide_legend(title = "Legend")) 
+```
+
+To achieve the highest revenue in the cost-benefit analysis, I try to find the optimal threshold with the plot below. As is shown in the plot, as threshold goes up, revenue first goes up and then goes down. With a threshold of 0.22, the revenue reaches its peak.
+
+```{r revenue_model}
+whichThreshold_revenue <- 
+whichThreshold %>% 
+    group_by(Threshold) %>% 
+    summarize(Revenue = sum(Revenue))
+
+  ggplot(whichThreshold_revenue)+
+  geom_line(aes(x = Threshold, y = Revenue, colour = "#FE9900"))+
+  geom_vline(xintercept =  pull(arrange(whichThreshold_revenue, -Revenue)[1,1]))+
+    labs(title = "Model Revenues By Threshold For Test Sample",
+         subtitle = "Vertical Line Denotes Optimal Threshold")+
+    theme(legend.position = "None")
+
+```
+
+I also explored the change of total count of credit with threshold. The total count of credit is calculated as 0.25 * True Positive + False Negative. Total count of credit keep rising as threshold goes up.
+
+```{r total count of credit}
+whichThreshold_credit <- 
+whichThreshold %>% 
+  mutate(credit =  ifelse(Variable == "True_Positive", (Count * 0.25),
+                             ifelse(Variable == "False_Negative", Count, 0))) %>%
+  group_by(Threshold) %>% 
+  summarize(Credit = sum(credit))
+
+  ggplot(whichThreshold_credit)+
+  geom_line(aes(x = Threshold, y = Credit, colour = "#FE9900"))+
+  geom_vline(xintercept =  pull(arrange(whichThreshold_credit, -Credit)[1,1]))+
+    labs(title = "Total Count of Credits By Threshold For Test Sample",
+         subtitle = "Vertical Line Denotes Optimal Threshold")+
+  theme(legend.position = "None")
+```
+
+At the end, I present a table of contrast of the optimal threshold (0.22) and the 0.50 threshold. At the optimal threshold, the revenue is maximum, and the credit reaches 86, a satisfying level. At the 0.50 threshold, the revenue is only 377150, about 69.7% of the maximum. To achieve the most renvenue, I'd like to pick the optimal threshold for this regression model.
+
+```{r threshold table}
+threshold_table <- merge(whichThreshold_revenue, whichThreshold_credit, by = "Threshold")
+
+final_table <- threshold_table %>%
+                  slice(22, 50) 
+
+kable(final_table, caption = "Total Revenue and Total Count of Credits for Optimal Threshold and 0.5 Threshold") %>% 
+  kable_styling()
+```
+
+
+# 6. Conclusions
+
+Generally speaking, I would not recommand my model to be put into practice. The main reason is that there is not a satisfying sensitivity. In this case, the model cannot predict accurately for the true positive, and may result in a waste of funding or missing the ones who need this credit.
+
+One reason for the low sensitivity is that there are only a small number of records of taking the credit. If there are more, I could probably train the model better. Another way to improve the model accuracy is to focus more on feature engineering. With better understanding of the variables regarding the realistic of Emil City and more effort on the process of variable transformation, the model would fit better.
+
